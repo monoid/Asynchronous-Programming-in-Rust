@@ -1,8 +1,12 @@
 #![feature(naked_functions)]
 use std::arch::asm;
+use std::arch::naked_asm;
 
 const DEFAULT_STACK_SIZE: usize = 1024 * 1024 * 2;
 const MAX_THREADS: usize = 4;
+const F_TRAMPOLINE_OFFSET: usize = 0;
+const GUARD_TRAMPOLINE_OFFSET: usize = F_TRAMPOLINE_OFFSET + std::mem::size_of::<u64>();
+
 static mut RUNTIME: usize = 0;
 
 pub struct Runtime {
@@ -26,19 +30,19 @@ struct Thread {
 #[derive(Debug, Default)]
 #[repr(C)]
 struct ThreadContext {
-    // fp is stored on stack before the switch call
-    sp: u64,  // 00
-    lr: u64,  // 08
-    r19: u64, // 10
-    r20: u64, // 18
-    r21: u64, // 20
-    r22: u64, // 28
-    r23: u64, // 30
-    r24: u64, // 38
-    r25: u64, // 40
-    r26: u64, // 48
-    r27: u64, // 50
-    r28: u64, // 58
+    r19: u64, // 00
+    r20: u64, // 08
+    r21: u64, // 10
+    r22: u64, // 18
+    r23: u64, // 20
+    r24: u64, // 28
+    r25: u64, // 30
+    r26: u64, // 38
+    r27: u64, // 40
+    r28: u64, // 48
+    fp: u64,  // 50
+    lr: u64,  // 58
+    sp: u64,  // 60
 }
 
 impl Thread {
@@ -117,7 +121,7 @@ impl Runtime {
                 in("x1") new,
                 clobber_abi("C"));
         }
-        self.threads.len() > 0
+        !self.threads.is_empty()
     }
 
     pub fn spawn(&mut self, f: fn()) {
@@ -129,15 +133,21 @@ impl Runtime {
 
         let size = available.stack.len();
 
+        // prepare stack for the trampoline
+        let stack_top;
         unsafe {
-            let s_ptr = available.stack.as_mut_ptr().offset(size as isize);
-            let s_ptr = (s_ptr as usize & !15) as *mut u8;
-            std::ptr::write(s_ptr.offset(-32) as *mut u64, f as u64);
-            std::ptr::write(s_ptr.offset(-16) as *mut u64, guard as u64);
-
-            available.ctx.lr = trampoline as u64;
-            available.ctx.sp = s_ptr.offset(-32) as u64;
+            let s_end = available.stack.as_mut_ptr().add(size);
+            let s_end_aligned = (s_end as usize & !15) as *mut u8;
+            stack_top = s_end_aligned.offset(-32);
+            std::ptr::write(stack_top.add(F_TRAMPOLINE_OFFSET).cast::<u64>(), f as u64);
+            std::ptr::write(
+                stack_top.add(GUARD_TRAMPOLINE_OFFSET).cast::<u64>(),
+                guard as u64,
+            );
         }
+        available.ctx.lr = trampoline as u64;
+        available.ctx.fp = 0;
+        available.ctx.sp = stack_top as u64;
         available.state = State::Ready;
     }
 } // We close the `impl Runtime` block here
@@ -156,55 +166,65 @@ pub fn yield_thread() {
     };
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 unsafe extern "C" fn trampoline() {
+    // the stack is prepared by the `Runtime::spawn`:
     // sp + 00      function_address
-    // sp + 08      reserved
-    // sp + 10      guard address
-    // sp + 18 ..   unused
-    asm!(
-        "ldr lr, [sp, 0x10]",
-        "ldr x1, [sp, 0x00]",
+    // sp + 08      guard address
+    // sp + 10 ..   unused
+    naked_asm! {
+        "ldr x1, [sp, {f_trampoline_offset}]",
+        "ldr lr, [sp, {guard_trampoline_offset}]",
+        "sub sp, sp, 0x10",  // current stack frame is not neeeded anymore
         "br x1",
-        options(noreturn)
-    )
+        f_trampoline_offset = const F_TRAMPOLINE_OFFSET,
+        guard_trampoline_offset = const GUARD_TRAMPOLINE_OFFSET,
+    };
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 unsafe extern "C" fn switch() {
-    asm!(
-        "str  lr, [x0, 0x08]",
-        "str  x19, [x0, 0x10]",
-        "str  x20, [x0, 0x18]",
-        "str  x21, [x0, 0x20]",
-        "str  x22, [x0, 0x28]",
-        "str  x23, [x0, 0x30]",
-        "str  x24, [x0, 0x38]",
-        "str  x25, [x0, 0x40]",
-        "str  x26, [x0, 0x48]",
-        "str  x27, [x0, 0x50]",
-        "str  x28, [x0, 0x58]",
-        // sp cannot be stored/loaded directly -- use an intermediate register, one of the stored/loaded
-        "mov  x19, sp",
-        "str  x19, [x0, 0x00]",
-        "ldr  x19, [x1, 0x00]",
-        "mov  sp, x19",
-        "ldr  lr, [x1, 0x08]",
-        "ldr  x19, [x1, 0x10]",
-        "ldr  x20, [x1, 0x18]",
-        "ldr  x21, [x1, 0x20]",
-        "ldr  x22, [x1, 0x28]",
-        "ldr  x23, [x1, 0x30]",
-        "ldr  x24, [x1, 0x38]",
-        "ldr  x25, [x1, 0x40]",
-        "ldr  x26, [x1, 0x48]",
-        "ldr  x27, [x1, 0x50]",
-        "ldr  x28, [x1, 0x58]",
-        "br lr",
-        options(noreturn)
-    );
+    naked_asm! {
+            // saving the old fiber.
+            // TODO we might use `stp` instruction to store a pair of registers at once, but we don't.
+            // TODO we might also use a postincrement instead of precomputed offsets.
+            // But this is not an ARM tutorial, really.
+            "str  x19, [x0, 0x00]",
+            "str  x20, [x0, 0x08]",
+            "str  x21, [x0, 0x10]",
+            "str  x22, [x0, 0x18]",
+            "str  x23, [x0, 0x20]",
+            "str  x24, [x0, 0x28]",
+            "str  x25, [x0, 0x30]",
+            "str  x26, [x0, 0x38]",
+            "str  x27, [x0, 0x40]",
+            "str  x28, [x0, 0x48]",
+            "str  fp, [x0, 0x50]",
+            "str  lr, [x0, 0x58]",
+            // sp cannot be stored/loaded directly -- use an intermediate register, one of the stored/loaded.
+            "mov  x2, sp",
+            "str  x2, [x0, 0x60]",
+
+            // loading the new fiber
+            // TODO we might use `ldp` instruction to load a pair of registers at once, but we don't.
+            "ldr  x19, [x1, 0x00]",
+            "ldr  x20, [x1, 0x08]",
+            "ldr  x21, [x1, 0x10]",
+            "ldr  x22, [x1, 0x18]",
+            "ldr  x23, [x1, 0x20]",
+            "ldr  x24, [x1, 0x28]",
+            "ldr  x25, [x1, 0x30]",
+            "ldr  x26, [x1, 0x38]",
+            "ldr  x27, [x1, 0x40]",
+            "ldr  x28, [x1, 0x48]",
+            "ldr  fp, [x1, 0x50]",
+            "ldr  lr, [x1, 0x58]",
+            "ldr  x2, [x1, 0x60]",
+            "mov  sp, x2",
+            "ret",
+    };
 }
 
 fn main() {
