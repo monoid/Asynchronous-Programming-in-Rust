@@ -138,7 +138,7 @@ impl Runtime {
         unsafe {
             let s_end = available.stack.as_mut_ptr().add(size);
             let s_end_aligned = (s_end as usize & !15) as *mut u8;
-            stack_top = s_end_aligned.offset(-32);
+            stack_top = s_end_aligned.offset(-16);
             std::ptr::write(stack_top.add(F_TRAMPOLINE_OFFSET).cast::<u64>(), f as u64);
             std::ptr::write(
                 stack_top.add(GUARD_TRAMPOLINE_OFFSET).cast::<u64>(),
@@ -172,7 +172,6 @@ unsafe extern "C" fn trampoline() {
     // the stack is prepared by the `Runtime::spawn`:
     // sp + 00      function_address
     // sp + 08      guard address
-    // sp + 10 ..   unused
     naked_asm! {
         "ldr x1, [sp, {f_trampoline_offset}]",
         "ldr lr, [sp, {guard_trampoline_offset}]",
